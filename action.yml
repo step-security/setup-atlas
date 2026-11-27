@@ -71,6 +71,10 @@ runs:
         INPUT_FLAVOR: ${{ inputs.flavor }}
       run: |
         version="$INPUT_VERSION"
+        if [[ ! "$version" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+          echo "::error::Invalid version '$version'. Use latest or a version such as v0.14.1."
+          exit 1
+        fi
         if [ -n "$INPUT_FLAVOR" ]; then
           version="extended-$version"
         fi
@@ -100,6 +104,7 @@ runs:
         mkdir -p "$ATLAS_BIN_DIR"
         # The installer skips the download if the binary at the target path
         # (e.g. restored from the cache) already matches the requested version.
+        # The installer verifies the binary against the .sha256 published next to it.
         curl -sSf https://atlasgo.sh | CI=true sh -s -- -o "$ATLAS_BIN_DIR/atlas"
         echo "$ATLAS_BIN_DIR" >> "$GITHUB_PATH"
         # The exact build (e.g. v1.3.8-f6d4fcb-canary) names the cache entry.
@@ -114,17 +119,47 @@ runs:
       with:
         path: ${{ steps.atlas-install.outputs.dir }}
         key: ${{ steps.atlas-install.outputs.key }}${{ steps.atlas-install-run.outputs.installed }}
-    - if: runner.os == 'Windows'
+    - name: Install Atlas (Windows)
+      if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_FLAVOR: ${{ inputs.flavor }}
       run: |
-        $version = "${{ inputs.version }}"
-        if ("${{ inputs.flavor }}" -ne "") {
+        $ErrorActionPreference = 'Stop'
+        $version = $env:INPUT_VERSION
+        if ($version -notmatch '^[A-Za-z0-9._+-]+$') {
+          Write-Output "::error::Invalid version '$version'. Use latest or a version such as v0.14.1."
+          exit 1
+        }
+        if ($env:INPUT_FLAVOR -ne "") {
           $version = "extended-$version"
         }
         $url = "https://atlasbinaries.com/atlas/atlas-windows-amd64-$version.exe"
         $targetPath = "$env:LocalAppData\Programs\Atlas"
-        New-Item -Path $targetPath -ItemType Directory -Force
-        curl -L $url -o "$targetPath\atlas.exe"
+        $exePath = Join-Path $targetPath "atlas.exe"
+        New-Item -Path $targetPath -ItemType Directory -Force | Out-Null
+        curl.exe -fsSL $url -o $exePath
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exePath)) {
+          Write-Output "::error::Failed to download Atlas from $url"
+          exit 1
+        }
+        # Verify against the checksum published next to the binary. Only a mismatch fails the step.
+        $want = $null
+        try {
+          $want = (Invoke-RestMethod -Uri "$url.sha256" -UseBasicParsing -TimeoutSec 30).ToString().Trim().Split()[0].ToLower()
+        } catch {
+          Write-Output "::warning::Could not fetch checksum from $url.sha256, skipping verification: $($_.Exception.Message)"
+        }
+        if ($want) {
+          $got = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) {
+            Remove-Item $exePath -Force
+            Write-Output "::error::Checksum mismatch for atlas.exe: expected $want, got $got"
+            exit 1
+          }
+          Write-Output "Checksum verified: $got"
+        }
         Add-Content $env:GITHUB_PATH "$targetPath"
     - name: Trim Token
       if: inputs.cloud-token != ''
@@ -134,7 +169,7 @@ runs:
         RAW: ${{ inputs.cloud-token }}
       run: |
         TRIMMED=$(echo "$RAW" | xargs)
-        echo "trimmed=$TRIMMED" >> $GITHUB_OUTPUT
+        echo "trimmed=$TRIMMED" >> "$GITHUB_OUTPUT"
     - name: Cache Atlas Grant
       if: steps.trim_token.outputs.trimmed != ''
       uses: actions/cache@v6
@@ -157,4 +192,4 @@ runs:
       shell: bash
       env:
         TOKEN: ${{ steps.trim_token.outputs.trimmed }}
-      run: echo "ATLAS_TOKEN=$TOKEN" >> $GITHUB_ENV
+      run: echo "ATLAS_TOKEN=$TOKEN" >> "$GITHUB_ENV"
